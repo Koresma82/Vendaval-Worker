@@ -1,22 +1,24 @@
 // replyDetector · liga-se à inbox por IMAP, deteta respostas de leads,
 // marca "respondeu" no Firestore e gera um rascunho de resposta com a IA.
-// É este módulo que fecha o ciclo de vendas sem trabalho manual.
 //
 // NOTA (Gmail + Cloudflare Email Routing):
-// O hello@tech-ramen.com reencaminha para o Gmail pessoal, por isso a INBOX
-// tem emails de leads MISTURADOS com email pessoal. Duas salvaguardas:
-//   1. Só olhamos para mensagens não-lidas dos últimos 7 dias
-//   2. Só marcamos como lida a mensagem SE o remetente for um lead conhecido
-// O resto da tua inbox fica intacto.
+// O hello@tech-ramen.com reencaminha para o Gmail. A INBOX tem emails de
+// leads misturados com email pessoal. Estratégia robusta:
+//   - Olha mensagens recentes (lidas OU não), dos últimos N dias
+//   - Associa ao lead por email do remetente OU do reply-to/return-path
+//     (o Cloudflare às vezes reescreve o From ao reencaminhar)
+//   - Guarda os UIDs já processados para não repetir nem re-notificar
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { admin, getActiveProjects, claude } from './firebase.js';
 
-const DIAS_A_OLHAR = 7;
+const DIAS_A_OLHAR = 3;
 
-function extractEmail(addr) {
-  const m = String(addr || '').match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-  return m ? m[0].toLowerCase() : '';
+// Extrai TODOS os emails de um texto (from pode ter vários formatos)
+function extractEmails(...partes) {
+  const txt = partes.filter(Boolean).join(' ');
+  const todos = txt.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+  return [...new Set(todos.map((e) => e.toLowerCase()))];
 }
 
 async function gerarRascunho(project, lead, textoResposta) {
@@ -33,7 +35,10 @@ Responde APENAS com o corpo do email, sem assunto, sem JSON.`;
 }
 
 export async function checkReplies(db) {
-  if (!process.env.IMAP_PASSWORD) return; // IMAP não configurado
+  if (!process.env.IMAP_PASSWORD) {
+    console.log('[replyDetector] IMAP_PASSWORD não definida — a saltar');
+    return;
+  }
 
   const client = new ImapFlow({
     host: process.env.IMAP_HOST,
@@ -47,50 +52,79 @@ export async function checkReplies(db) {
   const lock = await client.getMailboxLock('INBOX');
 
   try {
-    // Só não-lidos dos últimos N dias — protege a inbox pessoal e é mais rápido
     const desde = new Date(Date.now() - DIAS_A_OLHAR * 86400000);
-    const unseen = await client.search({ seen: false, since: desde });
-    if (!unseen.length) return;
+    // Mensagens recentes, lidas OU não (abrir o email no Gmail não deve escondê-lo)
+    const uids = await client.search({ since: desde });
+    if (!uids.length) return;
 
     const projects = await getActiveProjects(db);
 
-    for (const uid of unseen) {
+    // Carrega os leads com email de todos os projetos ativos, uma vez
+    const leadsPorEmail = new Map();
+    for (const project of projects) {
+      const snap = await db.collection('projects').doc(project.id).collection('leads').get();
+      snap.docs.forEach((d) => {
+        const lead = { id: d.id, ref: d.ref, project, ...d.data() };
+        if (lead.email) leadsPorEmail.set(lead.email.toLowerCase(), lead);
+      });
+    }
+
+    // Estado: UIDs já processados (para não repetir)
+    const stateRef = db.collection('worker_state').doc('replyDetector');
+    const state = (await stateRef.get()).data() || {};
+    const processados = new Set(state.uidsProcessados || []);
+
+    let novos = 0;
+
+    for (const uid of uids) {
+      if (processados.has(uid)) continue;
+
       const msg = await client.fetchOne(uid, { source: true });
       const parsed = await simpleParser(msg.source);
-      const remetente = extractEmail(parsed.from?.text);
-      if (!remetente) continue;
 
-      // Procurar o remetente nos leads de todos os projetos ativos
-      let encontrado = false;
-      for (const project of projects) {
-        const snap = await db
-          .collection('projects').doc(project.id).collection('leads')
-          .where('email', '==', remetente).limit(1).get();
-        if (snap.empty) continue;
+      // Emails candidatos: do From, Reply-To, e Return-Path
+      const candidatos = extractEmails(
+        parsed.from?.text,
+        parsed.replyTo?.text,
+        parsed.headers?.get('return-path'),
+      );
 
-        const leadRef = snap.docs[0].ref;
-        const lead = snap.docs[0].data();
-        encontrado = true;
+      // Ignora emails enviados por nós próprios (o remetente da campanha)
+      const meusEmails = projects.map((p) => (p.remetente?.email || '').toLowerCase());
 
-        // Não regredir estados avançados
-        if (!['trial', 'cliente', 'opt_out'].includes(lead.estado)) {
-          const texto = (parsed.text || '').trim();
-          const rascunho = await gerarRascunho(project, lead, texto);
-
-          await leadRef.update({
-            estado: 'respondeu',
-            ultimaResposta: texto.slice(0, 2000),
-            rascunhoResposta: rascunho,
-            respondeuEm: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          console.log(`[replyDetector] 🔥 ${lead.nome} respondeu (${project.nome})`);
-        }
-        break;
+      let lead = null;
+      for (const email of candidatos) {
+        if (meusEmails.includes(email)) continue;
+        if (leadsPorEmail.has(email)) { lead = leadsPorEmail.get(email); break; }
       }
 
-      // Marcar como lida apenas se era de um lead (o resto da inbox fica intacto)
-      if (encontrado) await client.messageFlagsAdd(uid, ['\\Seen']);
+      // Marca como processado independentemente (evita re-análise)
+      processados.add(uid);
+
+      if (!lead) continue; // não é resposta de nenhum lead conhecido
+
+      if (['trial', 'cliente', 'opt_out'].includes(lead.estado)) continue;
+
+      const texto = (parsed.text || parsed.subject || '').trim();
+      const rascunho = await gerarRascunho(lead.project, lead, texto);
+
+      await lead.ref.update({
+        estado: 'respondeu',
+        ultimaResposta: texto.slice(0, 2000),
+        rascunhoResposta: rascunho,
+        respondeuEm: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`[replyDetector] 🔥 ${lead.nome} respondeu (${lead.project.nome})`);
+      novos++;
     }
+
+    // Guarda os últimos 500 UIDs processados (evita crescer sem limite)
+    await stateRef.set({
+      uidsProcessados: [...processados].slice(-500),
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (novos) console.log(`[replyDetector] ${novos} respostas novas`);
   } finally {
     lock.release();
     await client.logout();

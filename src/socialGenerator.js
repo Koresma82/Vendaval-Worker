@@ -66,13 +66,27 @@ Responde APENAS com JSON válido, sem markdown:
 {"posts":[{"tema":"...","instagram":"...","linkedin":"...","tituloImagem":"..."}]}`;
 
     try {
-      const raw = await claude(prompt, 4000);
-      let jsonStr = raw;
-      if (!jsonStr.startsWith('{')) {
-        const i = jsonStr.indexOf('{'); const j = jsonStr.lastIndexOf('}');
-        if (i !== -1 && j !== -1) jsonStr = jsonStr.slice(i, j + 1);
+      // Gera em 2 lotes de 6 posts. Pedir os 12 de uma vez estoura o limite
+      // de tokens e o JSON vem cortado a meio ("Unterminated string").
+      const LOTES = 2;
+      const PORLOTE = Math.ceil(POSTS_POR_MES / LOTES);
+      let posts = [];
+
+      for (let lote = 0; lote < LOTES; lote++) {
+        const promptLote = prompt.replace(
+          `Gera ${POSTS_POR_MES} posts`,
+          `Gera ${PORLOTE} posts (lote ${lote + 1} de ${LOTES}, varia em relação aos outros lotes)`,
+        );
+        const raw = await claude(promptLote, 3500);
+        let jsonStr = raw;
+        if (!jsonStr.startsWith('{')) {
+          const i = jsonStr.indexOf('{'); const j = jsonStr.lastIndexOf('}');
+          if (i !== -1 && j !== -1) jsonStr = jsonStr.slice(i, j + 1);
+        }
+        const parsed = JSON.parse(jsonStr);
+        posts = posts.concat(parsed.posts || []);
       }
-      const { posts } = JSON.parse(jsonStr);
+
       const agenda = calcularAgenda(posts.length);
 
       const batch = db.batch();
