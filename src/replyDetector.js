@@ -46,6 +46,11 @@ export async function checkReplies(db) {
     secure: true,
     auth: { user: process.env.IMAP_USER, pass: process.env.IMAP_PASSWORD },
     logger: false,
+    // Timeouts explícitos: sem isto, uma ligação recusada fica pendurada
+    // para sempre e congela o worker todo.
+    connectionTimeout: 20000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
   });
 
   await client.connect();
