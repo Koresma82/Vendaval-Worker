@@ -55,9 +55,10 @@ async function uploadImagem(buffer, path) {
 }
 
 // --- Instagram Graph API ----------------------------------------
-async function publicarInstagram(imageUrl, caption) {
-  const token = process.env.META_ACCESS_TOKEN;
-  const igUser = process.env.IG_USER_ID;
+async function publicarInstagram(imageUrl, caption, cred = {}) {
+  // Credenciais vêm do Firestore (social_config/instagram); fallback env vars
+  const token = cred.accessToken || process.env.META_ACCESS_TOKEN;
+  const igUser = cred.igUserId || process.env.IG_USER_ID;
   if (!token || !igUser) return false;
 
   const r1 = await fetch(`https://graph.facebook.com/v20.0/${igUser}/media`, {
@@ -109,20 +110,26 @@ async function publicarLinkedin(texto) {
 // --- Loop principal ----------------------------------------------
 const MAPA_DIAS = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
 
-// Está na altura de publicar para este projeto agora?
-// Regra: hoje é um dia de publicação, passou da hora definida, e ainda não
-// publicámos hoje. Assim sai 1 post por dia de publicação (3/semana = 3 dias).
+// Está na altura de publicar no Instagram para este projeto agora?
 async function devePublicarAgora(db, project) {
-  const dias = project.diasPublicacao?.length ? project.diasPublicacao : ['MO', 'WE', 'FR'];
+  // Lê a periodicidade do Instagram (novo formato), com fallback ao antigo
+  const pInsta = project.periodicidadeRedes?.instagram || {
+    ativa: true,
+    postsPorSemana: project.postsPorSemana ?? 3,
+    dias: project.diasPublicacao || ['MO', 'WE', 'FR'],
+    hora: project.horaPublicacao || '10:00',
+  };
+  if (pInsta.ativa === false) return false;
+
+  const dias = pInsta.dias?.length ? pInsta.dias : ['MO', 'WE', 'FR'];
   const diasNum = dias.map((d) => MAPA_DIAS[d]);
   const agora = new Date();
   if (!diasNum.includes(agora.getDay())) return false;
 
-  const [hh, mm] = (project.horaPublicacao || '10:00').split(':').map(Number);
+  const [hh, mm] = (pInsta.hora || '10:00').split(':').map(Number);
   const horaAlvo = new Date(agora); horaAlvo.setHours(hh, mm, 0, 0);
-  if (agora < horaAlvo) return false; // ainda não chegou a hora
+  if (agora < horaAlvo) return false;
 
-  // Já publicámos hoje? Verifica no estado do worker
   const ref = db.collection('worker_state').doc(`publisher_${project.id}`);
   const st = (await ref.get()).data() || {};
   const hoje = agora.toISOString().slice(0, 10);
@@ -132,6 +139,13 @@ async function devePublicarAgora(db, project) {
 
 export async function publishApprovedPosts(db) {
   const projects = await getActiveProjects(db);
+
+  // Credenciais das redes (guardadas na app → Firestore)
+  let credInstagram = {};
+  try {
+    const cfg = await db.collection('social_config').doc('instagram').get();
+    if (cfg.exists) credInstagram = cfg.data();
+  } catch { /* usa env vars como fallback */ }
 
   for (const project of projects) {
     // Só publica se estiver na janela de ritmo (1 por dia de publicação)
@@ -166,7 +180,7 @@ export async function publishApprovedPosts(db) {
             url = await uploadImagem(buffer, `social/${project.id}/${docSnap.id}.png`);
           }
           updates.imagemUrl = url;
-          const ok = await publicarInstagram(url, post.instagram);
+          const ok = await publicarInstagram(url, post.instagram, credInstagram);
           updates.publicadoInstagram = ok;
           if (!ok) updates.instagramManual = true; // sem credenciais → manual
         }
