@@ -1,53 +1,39 @@
-// socialGenerator · gera um MÊS de conteúdo de uma vez (12 posts/projeto),
-// com datas de publicação agendadas automaticamente (3/semana em horários B2B).
-// Os posts ficam 'pendente' à espera de aprovação em lote na app.
-// O socialPublisher só publica cada um quando a data agendada chega.
+// socialGenerator · modelo de FILA (depósito de conteúdo).
+// Já não gera por mês com datas fixas. Em vez disso:
+//   - Mantém uma FILA de posts por projeto.
+//   - Quando a fila (pendentes + aprovados por publicar) desce abaixo de
+//     um limiar, gera um lote novo (LOTE_TAMANHO posts).
+//   - Os posts novos entram como 'pendente' (à espera de aprovação), a menos
+//     que o projeto tenha publicacaoAutomatica → entram 'aprovado'.
+//   - NÃO têm data: o socialPublisher tira da fila ao ritmo definido
+//     (postsPorSemana / dias / hora) e publica aleatoriamente.
 import { admin, getActiveProjects, claude } from './firebase.js';
 
-const POSTS_POR_MES = 12;            // 3/semana x 4 semanas
-const HORARIOS = ['09:30', '13:00', '18:30']; // bons horários B2B (PT)
-const DIAS_SEMANA = [1, 3, 5];       // seg, qua, sex (1=seg ... 5=sex)
-
-function mesAtual() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-}
-
-// Calcula 12 datas: seg/qua/sex às HORARIOS, a começar no próximo dia útil.
-// Espalha os 3 horários pelos posts para não sair tudo à mesma hora.
-function calcularAgenda(n) {
-  const datas = [];
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() + 1); // começa amanhã
-  let h = 0;
-  while (datas.length < n) {
-    if (DIAS_SEMANA.includes(d.getDay())) {
-      const [hh, mm] = HORARIOS[h % HORARIOS.length].split(':');
-      const data = new Date(d);
-      data.setHours(Number(hh), Number(mm), 0, 0);
-      datas.push(data);
-      h++;
-    }
-    d.setDate(d.getDate() + 1);
-  }
-  return datas;
-}
+const LOTE_TAMANHO = 40;   // quantos posts gerar de cada vez que a fila esvazia
+const LIMIAR_FILA = 5;     // gera mais quando restam menos de isto por publicar
 
 export async function generateSocialContent(db) {
-  const stateRef = db.collection('worker_state').doc('socialGenerator');
-  const state = (await stateRef.get()).data() || {};
-  const mes = mesAtual();
-
-  // Gera uma vez por mês (automático). O botão "Gerar mês" na app força
-  // via campo forcarGeracao — ver App. Aqui respeitamos o ciclo mensal.
-  if (state.ultimoMes === mes && !state.forcar) return;
-
   const projects = await getActiveProjects(db);
+  const forcarRef = db.collection('worker_state').doc('socialGenerator');
+  const forcarState = (await forcarRef.get()).data() || {};
 
   for (const project of projects) {
-    const prompt = `És o gestor de redes sociais da TechRamen (marca indie de software, tom autêntico de criador solo português).
-Gera ${POSTS_POR_MES} posts para um mês inteiro sobre o produto:
+    const col = db.collection('projects').doc(project.id).collection('social');
+
+    // Conta a fila: posts ainda não publicados (pendente ou aprovado)
+    const filaSnap = await col
+      .where('estado', 'in', ['pendente', 'aprovado'])
+      .get();
+    const naFila = filaSnap.size;
+
+    // Gera se: a fila está abaixo do limiar, OU o utilizador forçou na app
+    const forcarEste = forcarState.forcar === true;
+    if (naFila >= LIMIAR_FILA && !forcarEste) continue;
+
+    const jaAprovadoAuto = project.publicacaoAutomatica === true;
+
+    const prompt = `És o gestor de redes sociais da TechRamen (marca indie de software PT, tom autêntico de criador solo).
+Gera ${LOTE_TAMANHO} posts variados sobre este produto, para uma fila de publicação:
 
 PRODUTO: ${project.nome} — ${project.produto}
 PÚBLICO: ${project.nicho}
@@ -55,67 +41,70 @@ ARGUMENTOS: ${(project.valueProps || []).join(' | ')}
 LANDING: ${project.landingUrl}
 
 Regras:
-- PT-PT sempre. Zero hype vazio, zero "🚀 GAME CHANGER".
-- Varia os formatos ao longo do mês: dicas úteis para o público (valor real),
-  bastidores/build-in-public, benefícios concretos com CTA suave, perguntas
-  que geram interação, mitos a desfazer. Não repitas a mesma estrutura.
-- Cada post: versão "instagram" (curta, 5-8 hashtags) e versão "linkedin"
-  (mais longa, profissional, sem excesso de hashtags).
-- "tituloImagem": frase de 4-8 palavras para o card visual.
+- PT-PT sempre. Zero hype vazio.
+- IDENTIFICA SEMPRE O PRODUTO: cada post tem de deixar claro que fala do
+  "${project.nome}". Menciona o nome no texto e usa a hashtag #${project.nome.replace(/\s/g, '')}.
+  O Instagram é partilhado por vários produtos TechRamen — o leitor tem de
+  perceber logo que este post é do ${project.nome} (${project.nicho}), não de outro.
+- VARIA muito os formatos ao longo dos ${LOTE_TAMANHO}: dicas úteis, bastidores,
+  benefícios com CTA suave, perguntas, mitos, casos de uso, comparações.
+  Como vão sair baralhados, cada post tem de funcionar sozinho.
+- Cada post: "instagram" (curto, 5-8 hashtags incluindo #${project.nome.replace(/\s/g, '')} e as do nicho) e "linkedin" (profissional).
+- "tituloImagem": 4-8 palavras para o card visual.
 Responde APENAS com JSON válido, sem markdown:
 {"posts":[{"tema":"...","instagram":"...","linkedin":"...","tituloImagem":"..."}]}`;
 
     try {
-      // Gera em 2 lotes de 6 posts. Pedir os 12 de uma vez estoura o limite
-      // de tokens e o JSON vem cortado a meio ("Unterminated string").
-      const LOTES = 2;
-      const PORLOTE = Math.ceil(POSTS_POR_MES / LOTES);
+      // Gera em lotes de 8 para não estourar tokens (40 de uma vez cortaria)
+      const SUBLOTE = 8;
+      const nSublotes = Math.ceil(LOTE_TAMANHO / SUBLOTE);
       let posts = [];
 
-      for (let lote = 0; lote < LOTES; lote++) {
-        const promptLote = prompt.replace(
-          `Gera ${POSTS_POR_MES} posts`,
-          `Gera ${PORLOTE} posts (lote ${lote + 1} de ${LOTES}, varia em relação aos outros lotes)`,
+      for (let i = 0; i < nSublotes; i++) {
+        const p = prompt.replace(
+          `Gera ${LOTE_TAMANHO} posts`,
+          `Gera ${SUBLOTE} posts (parte ${i + 1} de ${nSublotes}, diferentes das outras partes)`,
         );
-        const raw = await claude(promptLote, 3500);
+        const raw = await claude(p, 3500);
         let jsonStr = raw;
         if (!jsonStr.startsWith('{')) {
-          const i = jsonStr.indexOf('{'); const j = jsonStr.lastIndexOf('}');
-          if (i !== -1 && j !== -1) jsonStr = jsonStr.slice(i, j + 1);
+          const a = jsonStr.indexOf('{'); const b = jsonStr.lastIndexOf('}');
+          if (a !== -1 && b !== -1) jsonStr = jsonStr.slice(a, b + 1);
         }
-        const parsed = JSON.parse(jsonStr);
-        posts = posts.concat(parsed.posts || []);
+        posts = posts.concat(JSON.parse(jsonStr).posts || []);
       }
 
-      const agenda = calcularAgenda(posts.length);
-
-      const batch = db.batch();
-      const col = db.collection('projects').doc(project.id).collection('social');
-
-      posts.forEach((p, i) => {
-        batch.set(col.doc(`${mes}_${i}`), {
-          ...p,
-          estado: project.publicacaoAutomatica === true ? 'aprovado' : 'pendente',
-          publicadoInstagram: false,
-          publicadoLinkedin: false,
-          // Data agendada: o publisher só publica quando esta data chega
-          agendadoPara: admin.firestore.Timestamp.fromDate(agenda[i]),
-          // Imagem: null = usa card gerado. Se meteres URL de screenshot, usa essa.
-          imagemPropriaUrl: null,
-          mes,
-          criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      // Grava a fila em lotes de 400 (limite do batch do Firestore é 500)
+      let escritos = 0;
+      while (escritos < posts.length) {
+        const batch = db.batch();
+        const fatia = posts.slice(escritos, escritos + 400);
+        fatia.forEach((p, idx) => {
+          const id = `q_${Date.now()}_${escritos + idx}`;
+          batch.set(col.doc(id), {
+            ...p,
+            estado: jaAprovadoAuto ? 'aprovado' : 'pendente',
+            publicadoInstagram: false,
+            publicadoLinkedin: false,
+            imagemPropriaUrl: null,
+            // ordem aleatória: chave usada pelo publisher para baralhar
+            ordemAleatoria: Math.random(),
+            naFila: true,
+            criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+          });
         });
-      });
-      await batch.commit();
-      console.log(`[socialGenerator] ${posts.length} posts (mês) gerados para ${project.nome}`);
+        await batch.commit();
+        escritos += fatia.length;
+      }
+
+      console.log(`[socialGenerator] +${posts.length} posts na fila de ${project.nome} (estava com ${naFila})`);
     } catch (err) {
       console.error(`[socialGenerator] falha em ${project.id}:`, err.message);
     }
   }
 
-  await stateRef.set({
-    ultimoMes: mes,
-    forcar: false,
-    geradoEm: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  // Limpa a flag de forçar (já gerámos)
+  if (forcarState.forcar) {
+    await forcarRef.set({ forcar: false, geradoEm: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  }
 }

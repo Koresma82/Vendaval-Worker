@@ -26,7 +26,7 @@ function wrapText(texto, maxChars = 22) {
   return linhas.slice(0, 4);
 }
 
-async function renderCard(titulo, nomeProjeto) {
+async function renderCard(titulo, nomeProjeto, corMarca = '#F5A524') {
   const linhas = wrapText(titulo);
   const startY = 540 - (linhas.length - 1) * 48;
   const textoSvg = linhas
@@ -35,12 +35,12 @@ async function renderCard(titulo, nomeProjeto) {
 
   const svg = `<svg width="1080" height="1080" xmlns="http://www.w3.org/2000/svg">
     <rect width="1080" height="1080" fill="#0E1420"/>
-    <rect x="0" y="0" width="1080" height="12" fill="#F5A524"/>
-    <text x="90" y="180" font-family="Arial" font-size="34" font-weight="600" fill="#F5A524" letter-spacing="4">${escapeXml(nomeProjeto.toUpperCase())} · TECHRAMEN</text>
+    <rect x="0" y="0" width="1080" height="12" fill="${corMarca}"/>
+    <text x="90" y="180" font-family="Arial" font-size="34" font-weight="600" fill="${corMarca}" letter-spacing="4">${escapeXml(nomeProjeto.toUpperCase())} · TECHRAMEN</text>
     ${textoSvg}
     <text x="90" y="980" font-family="Arial" font-size="30" fill="#8B93A7">tech-ramen.com</text>
-    <circle cx="960" cy="950" r="56" fill="none" stroke="#F5A524" stroke-width="6"/>
-    <text x="960" y="972" font-family="Arial" font-size="56" text-anchor="middle" fill="#F5A524">🍜</text>
+    <circle cx="960" cy="950" r="56" fill="none" stroke="${corMarca}" stroke-width="6"/>
+    <text x="960" y="972" font-family="Arial" font-size="56" text-anchor="middle" fill="${corMarca}">🍜</text>
   </svg>`;
 
   return sharp(Buffer.from(svg)).png().toBuffer();
@@ -107,25 +107,54 @@ async function publicarLinkedin(texto) {
 }
 
 // --- Loop principal ----------------------------------------------
+const MAPA_DIAS = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+
+// Está na altura de publicar para este projeto agora?
+// Regra: hoje é um dia de publicação, passou da hora definida, e ainda não
+// publicámos hoje. Assim sai 1 post por dia de publicação (3/semana = 3 dias).
+async function devePublicarAgora(db, project) {
+  const dias = project.diasPublicacao?.length ? project.diasPublicacao : ['MO', 'WE', 'FR'];
+  const diasNum = dias.map((d) => MAPA_DIAS[d]);
+  const agora = new Date();
+  if (!diasNum.includes(agora.getDay())) return false;
+
+  const [hh, mm] = (project.horaPublicacao || '10:00').split(':').map(Number);
+  const horaAlvo = new Date(agora); horaAlvo.setHours(hh, mm, 0, 0);
+  if (agora < horaAlvo) return false; // ainda não chegou a hora
+
+  // Já publicámos hoje? Verifica no estado do worker
+  const ref = db.collection('worker_state').doc(`publisher_${project.id}`);
+  const st = (await ref.get()).data() || {};
+  const hoje = agora.toISOString().slice(0, 10);
+  if (st.ultimoDiaPublicado === hoje) return false;
+  return true;
+}
+
 export async function publishApprovedPosts(db) {
   const projects = await getActiveProjects(db);
 
   for (const project of projects) {
+    // Só publica se estiver na janela de ritmo (1 por dia de publicação)
+    if (!(await devePublicarAgora(db, project))) continue;
+
+    // Tira 1 post aleatório da fila de aprovados
     const snap = await db
       .collection('projects').doc(project.id).collection('social')
-      .where('estado', '==', 'aprovado').limit(20).get();
+      .where('estado', '==', 'aprovado').limit(50).get();
+
+    if (snap.empty) continue; // fila vazia — nada a publicar
+
+    // Ordem aleatória: escolhe o post com menor ordemAleatoria (baralhado)
+    const docs = snap.docs.sort((a, b) =>
+      (a.data().ordemAleatoria || 0) - (b.data().ordemAleatoria || 0));
+    const alvo = [docs[0]]; // publica 1 por ciclo de dia
 
     const agora = admin.firestore.Timestamp.now();
+    let publicouAlgum = false;
 
-    for (const docSnap of snap.docs) {
+    for (const docSnap of alvo) {
       const post = docSnap.data();
       const updates = {};
-
-      // Só publica quando a data agendada já chegou. Posts aprovados mas
-      // ainda no futuro esperam pela sua vez.
-      if (post.agendadoPara && post.agendadoPara.toMillis() > agora.toMillis()) {
-        continue;
-      }
 
       try {
         // Instagram
@@ -133,7 +162,7 @@ export async function publishApprovedPosts(db) {
           let url = post.imagemPropriaUrl;
           // Se não forneceste screenshot, gera o card de texto TechRamen
           if (!url) {
-            const buffer = await renderCard(post.tituloImagem || post.tema, project.nome);
+            const buffer = await renderCard(post.tituloImagem || post.tema, project.nome, project.corMarca);
             url = await uploadImagem(buffer, `social/${project.id}/${docSnap.id}.png`);
           }
           updates.imagemUrl = url;
@@ -155,11 +184,20 @@ export async function publishApprovedPosts(db) {
         updates.publicadoEm = admin.firestore.FieldValue.serverTimestamp();
 
         await docSnap.ref.update(updates);
-        console.log(`[socialPublisher] post ${docSnap.id} → ${updates.estado}`);
+        publicouAlgum = true;
+        console.log(`[socialPublisher] post ${docSnap.id} → ${updates.estado} (${project.nome})`);
       } catch (err) {
         console.error(`[socialPublisher] ${docSnap.id}:`, err.message);
         await docSnap.ref.update({ estado: 'erro', erro: err.message });
       }
+    }
+
+    // Marca que já publicámos hoje, para não repetir no mesmo dia
+    if (publicouAlgum) {
+      await db.collection('worker_state').doc(`publisher_${project.id}`).set({
+        ultimoDiaPublicado: new Date().toISOString().slice(0, 10),
+        atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
     }
   }
 }
